@@ -220,7 +220,8 @@ and use **Attach again** or remove the missing file before sending.
 
 Choose a speech provider in **Settings → Voice → Read aloud**, then use **Read aloud**
 beside a completed assistant reply. Select it again to stop playback. Leaving the
-thread stops it. Code blocks are skipped by default.
+thread stops it. Code blocks are skipped by default. On web and desktop, a player above the
+thread pauses, seeks, and sets volume and speed; a speed chosen there becomes your default.
 
 The paragraph and the word being read are highlighted, and the thread scrolls along until
 you scroll away. ElevenLabs reports exact word timings. With other providers the word

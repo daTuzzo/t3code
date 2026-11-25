@@ -26,6 +26,8 @@ export function ReadAloudButton({ id, text }: { id: string; text: string }) {
   if (settings.provider === "off") return null;
   const active = state.id === id;
   const stoppable = active && (state.status === "playing" || state.status === "loading");
+  // Finished audio stays loaded, so reading it again needs no new speech.
+  const resumable = active && (state.status === "paused" || state.status === "ended");
   const label = stoppable
     ? gt("Stop reading")
     : active && state.status === "paused"
@@ -47,7 +49,7 @@ export function ReadAloudButton({ id, text }: { id: string; text: string }) {
             aria-label={label}
             onClick={async () => {
               if (stoppable) return readAloudController.stop();
-              if (active && state.status === "paused") await readAloudController.resume();
+              if (resumable) await readAloudController.resume();
               else await readAloudController.start(id, text, settings);
               toastReadAloudError(id, gt("Could not read aloud"));
             }}

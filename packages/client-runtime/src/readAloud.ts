@@ -40,6 +40,26 @@ export function createReadAloudWarmup(
 /** A word as UTF-16 offsets in the text a playback speaks. */
 export type SpokenWord = { readonly start: number; readonly end: number };
 
+/** Seconds; `duration` is `Infinity` until all of the audio has arrived. */
+export type SpeechProgress = {
+  time: number;
+  duration: number;
+  /** The end of the audio that has arrived. */
+  buffered: number;
+  /** False for a stream the player cannot move in. */
+  seekable: boolean;
+  ended: boolean;
+};
+
+/** A playback with a timeline, such as a media element. Speech engines that only speak have none. */
+export type SpeechMedia = {
+  progress: () => SpeechProgress;
+  subscribe: (listener: () => void) => () => void;
+  seek: (seconds: number) => void;
+  setSpeed: (speed: number) => void;
+  setVolume: (volume: number, muted: boolean) => void;
+};
+
 export type SpeechPlayback = {
   play: () => Promise<void>;
   pause: () => void;
@@ -47,6 +67,7 @@ export type SpeechPlayback = {
   finished: Promise<void>;
   /** Reports each word as it is spoken, and null when none is; returns the unsubscribe. */
   words?: (listener: (word: SpokenWord | null) => void) => () => void;
+  media?: SpeechMedia;
 };
 
 /** What a read-aloud message is reading now, for clients to highlight. */
@@ -170,7 +191,7 @@ export function createReadAloudController(
 ) {
   type State = {
     id: string | null;
-    status: "idle" | "loading" | "playing" | "paused" | "error";
+    status: "idle" | "loading" | "playing" | "paused" | "ended" | "error";
     error?: string;
   };
   let state: State = { id: null, status: "idle" };
@@ -219,6 +240,26 @@ export function createReadAloudController(
     readonly markdown: string;
     readonly settings: ReadAloudSettings;
   } | null = null;
+  let speed = 1;
+  let progress: SpeechProgress | null = null;
+  const progressListeners = new Set<() => void>();
+  let unwatch: (() => void) | null = null;
+  // The last audio stays loaded after it ends, so it can be replayed or sought into.
+  let kept = false;
+  const watch = (next: SpeechPlayback | null) => {
+    unwatch?.();
+    unwatch = null;
+    const media = next?.media;
+    progress = media ? media.progress() : null;
+    if (media)
+      unwatch = media.subscribe(() => {
+        progress = media.progress();
+        if (kept && progress.ended && state.status === "playing")
+          publish({ id: state.id, status: "ended" });
+        for (const listener of progressListeners) listener();
+      });
+    for (const listener of progressListeners) listener();
+  };
   const stop = () => {
     reading = null;
     stopFollowing();
@@ -228,6 +269,8 @@ export function createReadAloudController(
     starting = false;
     resumePending?.();
     resumePending = null;
+    kept = false;
+    watch(null);
     if (playback) dispose(playback);
     playback = null;
     publish({ id: null, status: "idle" });
@@ -258,15 +301,17 @@ export function createReadAloudController(
     if (!chunks.length) return;
     const owner = new AbortController();
     active = owner;
+    speed = settings.speed;
     try {
-      for (const chunk of chunks) {
+      for (const [index, chunk] of chunks.entries()) {
         publish({ id, status: paused ? "paused" : "loading" });
-        const next = await prepare(chunk.text, settings, owner.signal);
+        const next = await prepare(chunk.text, { ...settings, speed }, owner.signal);
         if (active !== owner) {
           dispose(next);
           return;
         }
         playback = next;
+        watch(next);
         if (next.words)
           unfollow = next.words((word) => {
             const position =
@@ -291,6 +336,13 @@ export function createReadAloudController(
         publish({ id, status: "playing" });
         await next.finished;
         if (active !== owner) return;
+        // The highlight keeps following it, so a seek or replay moves the highlighted word.
+        if (next.media && index === chunks.length - 1) {
+          kept = true;
+          publish({ id, status: "ended" });
+          return;
+        }
+        watch(null);
         stopFollowing();
         dispose(next);
         playback = null;
@@ -325,6 +377,30 @@ export function createReadAloudController(
       };
     },
     stop,
+    /** The current audio's position, or `null` when it has no timeline. */
+    getProgress: () => progress,
+    subscribeProgress: (listener: () => void) => {
+      progressListeners.add(listener);
+      return () => {
+        progressListeners.delete(listener);
+      };
+    },
+    seek(seconds: number) {
+      const media = playback?.media;
+      if (!media) return;
+      media.seek(seconds);
+      if (state.status === "ended") publish({ ...state, status: "paused" });
+    },
+    /** Applies to the current audio and to the rest of the reply. */
+    setSpeed(value: number) {
+      speed = value;
+      // A jump reads the reply again with these settings.
+      if (reading) reading = { ...reading, settings: { ...reading.settings, speed: value } };
+      playback?.media?.setSpeed(value);
+    },
+    setVolume(volume: number, muted: boolean) {
+      playback?.media?.setVolume(volume, muted);
+    },
     pause() {
       if (disposing || !active || (state.status !== "playing" && state.status !== "loading"))
         return;
@@ -333,7 +409,7 @@ export function createReadAloudController(
       if (!starting) playback?.pause();
     },
     async resume() {
-      if (state.status !== "paused" || !active) return;
+      if ((state.status !== "paused" && state.status !== "ended") || !active) return;
       paused = false;
       if (resumePending) {
         const resume = resumePending;

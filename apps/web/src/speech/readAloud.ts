@@ -1,4 +1,5 @@
 import { m } from "~/i18n/messages";
+import * as Schema from "effect/Schema";
 import { speechSpeedAppliedByProvider, type SpeechSynthesisCatalog } from "@t3tools/contracts";
 import {
   createReadAloudController,
@@ -14,8 +15,168 @@ import {
   startSpeechSynthesis,
 } from "@t3tools/client-runtime/voice-input";
 import { spokenWordAt } from "@t3tools/shared/read-aloud";
+import { readLocalStorageValue } from "../hooks/useLocalStorage";
 import { readPreparedConnection } from "../state/session";
 import { runEnvironmentSpeech } from "./runEnvironmentSpeech";
+
+export const READ_ALOUD_VOLUME_STORAGE_KEY = "t3code:read-aloud-volume:v1";
+export const ReadAloudVolume = Schema.Struct({
+  volume: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+  muted: Schema.Boolean,
+});
+export const DEFAULT_READ_ALOUD_VOLUME: typeof ReadAloudVolume.Type = { volume: 1, muted: false };
+
+const appended = (buffer: SourceBuffer) =>
+  new Promise((resolve) => buffer.addEventListener("updateend", resolve, { once: true }));
+
+/**
+ * Feeds the synthesis stream to a MediaSource. Media elements cannot seek in a stream served
+ * without byte ranges, but they can seek in the audio a MediaSource has buffered.
+ */
+async function streamAudio(
+  audio: HTMLAudioElement,
+  source: MediaSource,
+  url: string,
+  signal: AbortSignal,
+  onAppend: () => void,
+) {
+  await new Promise((resolve) => source.addEventListener("sourceopen", resolve, { once: true }));
+  const buffer = source.addSourceBuffer("audio/mpeg");
+  buffer.mode = "sequence";
+  const response = await fetch(url, { signal });
+  if (!response.ok || !response.body) throw new Error("The speech stream is unavailable.");
+  const reader = response.body.getReader();
+  for (let read = await reader.read(); !read.done; read = await reader.read()) {
+    for (;;) {
+      try {
+        buffer.appendBuffer(read.value);
+        break;
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "QuotaExceededError")) throw error;
+        // The browser evicts audio that has already played once playback moves on.
+        await new Promise((resolve) =>
+          audio.addEventListener("timeupdate", resolve, { once: true }),
+        );
+      }
+    }
+    await appended(buffer);
+    onAppend();
+  }
+  source.endOfStream();
+}
+
+const MEDIA_EVENTS = ["timeupdate", "durationchange", "seeking", "ended", "emptied"] as const;
+// Each one moves the media clock or starts or stops it.
+const CLOCK_EVENTS = ["play", "playing", "pause", "seeked", "ratechange", "waiting"] as const;
+
+function mediaPlayback(
+  url: string,
+  speed: number,
+  synthesizedSpeed: number | null,
+  timings: Omit<Parameters<typeof createTimedWords>[0], "clock">,
+) {
+  const audio = new Audio();
+  const rate = (value: number) => (synthesizedSpeed ? value / synthesizedSpeed : value);
+  // Loading media resets `playbackRate` to `defaultPlaybackRate`.
+  audio.defaultPlaybackRate = audio.playbackRate = rate(speed);
+  const saved = readLocalStorageValue(
+    READ_ALOUD_VOLUME_STORAGE_KEY,
+    DEFAULT_READ_ALOUD_VOLUME,
+    ReadAloudVolume,
+  );
+  audio.volume = saved.volume;
+  audio.muted = saved.muted;
+  const listeners = new Set<() => void>();
+  const notify = () => {
+    for (const listener of listeners) listener();
+  };
+  const abort = new AbortController();
+  let done: () => void = () => {};
+  let fail: (error: Error) => void = () => {};
+  const finished = new Promise<void>((resolve, reject) => {
+    done = resolve;
+    fail = reject;
+    audio.onended = () => resolve();
+    audio.onerror = () => reject(new Error("Could not play the generated speech."));
+  });
+  if (window.MediaSource?.isTypeSupported("audio/mpeg")) {
+    const source = new MediaSource();
+    const sourceUrl = URL.createObjectURL(source);
+    audio.src = sourceUrl;
+    void streamAudio(audio, source, url, abort.signal, notify).then(
+      () => URL.revokeObjectURL(sourceUrl),
+      () => {
+        URL.revokeObjectURL(sourceUrl);
+        if (!abort.signal.aborted) fail(new Error("Could not play the generated speech."));
+      },
+    );
+  } else audio.src = url;
+  const seekableEnd = () =>
+    audio.seekable.length ? audio.seekable.end(audio.seekable.length - 1) : 0;
+  let timed: ReturnType<typeof createTimedWords> | null = null;
+  return {
+    play: () => audio.play(),
+    pause: () => audio.pause(),
+    stop: () => {
+      if (timed) for (const type of CLOCK_EVENTS) audio.removeEventListener(type, timed.refresh);
+      timed?.stop();
+      abort.abort();
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      done();
+    },
+    finished,
+    // The highlight follows this element's clock, so seeking and speed changes move it too.
+    words: (listener) => {
+      if (!timed) {
+        timed = createTimedWords({
+          ...timings,
+          clock: () => ({
+            seconds: audio.currentTime,
+            rate: audio.playbackRate,
+            playing: !audio.paused,
+          }),
+        });
+        for (const type of CLOCK_EVENTS) audio.addEventListener(type, timed.refresh);
+      }
+      return timed.subscribe(listener);
+    },
+    media: {
+      progress: () => ({
+        time: audio.currentTime,
+        duration: Number.isFinite(audio.duration) ? audio.duration : Infinity,
+        buffered: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
+        seekable: seekableEnd() > 0,
+        ended: audio.ended,
+      }),
+      subscribe: (listener: () => void) => {
+        if (!listeners.size) for (const type of MEDIA_EVENTS) audio.addEventListener(type, notify);
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+          if (!listeners.size)
+            for (const type of MEDIA_EVENTS) audio.removeEventListener(type, notify);
+        };
+      },
+      // Short of the end while audio is still arriving, so playback does not stall on it.
+      seek: (seconds: number) => {
+        if (!seekableEnd()) return;
+        const end = Number.isFinite(audio.duration) ? audio.duration : seekableEnd() - 0.25;
+        audio.currentTime = Math.max(0, Math.min(seconds, end));
+        // `seeking` fires a task later; the position is already readable.
+        notify();
+      },
+      setSpeed: (value: number) => {
+        audio.defaultPlaybackRate = audio.playbackRate = rate(value);
+      },
+      setVolume: (volume: number, muted: boolean) => {
+        audio.volume = volume;
+        audio.muted = muted;
+      },
+    },
+  } satisfies SpeechPlayback;
+}
 
 function systemPlayback(
   text: string,
@@ -70,9 +231,6 @@ function systemPlayback(
   };
 }
 
-// Each one moves the media clock or starts or stops it.
-const CLOCK_EVENTS = ["play", "playing", "pause", "seeked", "ratechange", "waiting"] as const;
-
 const catalogs = new WeakMap<AbortSignal, Promise<SpeechSynthesisCatalog>>();
 
 export const warmReadAloud = createReadAloudWarmup(async (environmentId, model) => {
@@ -110,43 +268,15 @@ export const readAloudController = createReadAloudController(async (text, settin
     { signal },
   );
   signal.throwIfAborted();
-  const audio = new Audio(url);
-  if (!speechSpeedAppliedByProvider(catalog, model)) audio.playbackRate = settings.speed;
-  let done: () => void = () => {};
-  const finished = new Promise<void>((resolve, reject) => {
-    done = resolve;
-    audio.onended = () => resolve();
-    audio.onerror = () => reject(new Error("Could not play the generated speech."));
-  });
-  let timed: ReturnType<typeof createTimedWords> | null = null;
-  return {
-    play: () => audio.play(),
-    pause: () => audio.pause(),
-    stop: () => {
-      if (timed) for (const type of CLOCK_EVENTS) audio.removeEventListener(type, timed.refresh);
-      timed?.stop();
-      audio.pause();
-      audio.removeAttribute("src");
-      audio.load();
-      done();
+  return mediaPlayback(
+    url,
+    settings.speed,
+    speechSpeedAppliedByProvider(catalog, model) ? settings.speed : null,
+    {
+      text,
+      wordTimings: catalog.wordTimings ?? "estimated",
+      load: (after, signal) =>
+        runEnvironmentSpeech(getSpeechSynthesisTimings(prepared, token, after), { signal }),
     },
-    finished,
-    words: (listener) => {
-      if (!timed) {
-        timed = createTimedWords({
-          text,
-          wordTimings: catalog.wordTimings ?? "estimated",
-          load: (after, signal) =>
-            runEnvironmentSpeech(getSpeechSynthesisTimings(prepared, token, after), { signal }),
-          clock: () => ({
-            seconds: audio.currentTime,
-            rate: audio.playbackRate,
-            playing: !audio.paused,
-          }),
-        });
-        for (const type of CLOCK_EVENTS) audio.addEventListener(type, timed.refresh);
-      }
-      return timed.subscribe(listener);
-    },
-  };
+  );
 }, m);

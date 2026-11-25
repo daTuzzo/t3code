@@ -207,6 +207,118 @@ it("keeps a new pause while resume activates playback", async () => {
   }
 });
 
+function mediaPlayback(duration: number) {
+  const finished = deferred<void>();
+  const listeners = new Set<() => void>();
+  const position = { time: 0, duration, buffered: duration, seekable: true, ended: false };
+  const notify = () => {
+    for (const listener of listeners) listener();
+  };
+  const playback = {
+    play: vi.fn(async () => {
+      position.ended = false;
+    }),
+    pause: vi.fn(),
+    stop: vi.fn(() => finished.resolve()),
+    finished: finished.promise,
+    media: {
+      progress: () => ({ ...position }),
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      seek: vi.fn((seconds: number) => {
+        position.time = seconds;
+        position.ended = false;
+        notify();
+      }),
+      setSpeed: vi.fn(),
+      setVolume: vi.fn(),
+    },
+  } satisfies SpeechPlayback;
+  const end = () => {
+    position.time = duration;
+    position.ended = true;
+    notify();
+    finished.resolve();
+  };
+  return { playback, end };
+}
+
+function playingCount(controller: ReturnType<typeof createReadAloudController>, count: number) {
+  const reached = deferred<void>();
+  let seen = 0;
+  const unsubscribe = controller.subscribe(() => {
+    if (controller.getSnapshot().status === "playing" && ++seen === count) reached.resolve();
+  });
+  return reached.promise.finally(unsubscribe);
+}
+
+it("keeps the last audio after it ends, so it replays and seeks without new speech", async () => {
+  const audio = mediaPlayback(20);
+  const prepare = vi.fn(async () => audio.playback);
+  const controller = createReadAloudController(prepare);
+  const progress = vi.fn();
+  const unsubscribe = controller.subscribeProgress(progress);
+  const playing = playingCount(controller, 1);
+  const run = controller.start("1", "reply", {
+    ...DEFAULT_READ_ALOUD_SETTINGS,
+    provider: "openai",
+  });
+  await playing;
+  controller.seek(3);
+  expect(controller.getProgress()?.time).toBe(3);
+  expect(progress).toHaveBeenCalled();
+  audio.end();
+  await run;
+  expect(controller.getSnapshot()).toEqual({ id: "1", status: "ended" });
+  expect(audio.playback.stop).not.toHaveBeenCalled();
+  controller.seek(12);
+  expect(audio.playback.media.seek).toHaveBeenLastCalledWith(12);
+  expect(controller.getSnapshot().status).toBe("paused");
+  await controller.resume();
+  expect(controller.getSnapshot().status).toBe("playing");
+  audio.end();
+  expect(controller.getSnapshot().status).toBe("ended");
+  await controller.resume();
+  expect(audio.playback.play).toHaveBeenCalledTimes(3);
+  expect(prepare).toHaveBeenCalledTimes(1);
+  controller.stop();
+  expect(audio.playback.stop).toHaveBeenCalledTimes(1);
+  expect(controller.getProgress()).toBeNull();
+  unsubscribe();
+});
+
+it("applies speed and volume to the playing audio, and speed to the rest of the reply", async () => {
+  const first = mediaPlayback(30);
+  const second = mediaPlayback(10);
+  const prepare = vi.fn(async (_text: string, _settings: { speed: number }) =>
+    prepare.mock.calls.length === 1 ? first.playback : second.playback,
+  );
+  const controller = createReadAloudController(prepare);
+  const playingFirst = playingCount(controller, 1);
+  const playingSecond = playingCount(controller, 2);
+  // System voices split long replies into several pieces.
+  const run = controller.start("1", "word ".repeat(1000), {
+    ...DEFAULT_READ_ALOUD_SETTINGS,
+    provider: "system",
+  });
+  await playingFirst;
+  controller.setSpeed(1.5);
+  controller.setVolume(0.4, true);
+  expect(first.playback.media.setSpeed).toHaveBeenCalledWith(1.5);
+  expect(first.playback.media.setVolume).toHaveBeenCalledWith(0.4, true);
+  first.end();
+  await playingSecond;
+  expect(prepare.mock.calls.map(([, settings]) => settings.speed)).toEqual([1, 1.5]);
+  expect(first.playback.stop).toHaveBeenCalled();
+  expect(controller.getProgress()?.duration).toBe(10);
+  controller.stop();
+  await run;
+});
+
 it("warms each local model once per interval, and again after a failed request", async () => {
   let now = 0;
   const failed = deferred<void>();

@@ -17,6 +17,7 @@ import {
   AuthSettingsWriteScope,
   CLOUD_SPEECH_PROVIDER_NAMES,
   READ_ALOUD_LABELS,
+  READ_ALOUD_SPEEDS,
   type EnvironmentId,
   EMPTY_SPEECH_SYNTHESIS_CATALOG,
   type ReadAloudSettings,
@@ -391,6 +392,8 @@ export function ReadAloudSettingsSection() {
   const selectedEnvironment = environments.find(
     (entry) => entry.environmentId === settings.environmentId,
   );
+  const previewing =
+    state.id === "read-aloud-preview" && state.status !== "error" && state.status !== "ended";
   return (
     <SettingsSection id="read-aloud-section" title={gt("Read aloud")}>
       <SettingsSearchTarget id="read-aloud">
@@ -716,7 +719,7 @@ export function ReadAloudSettingsSection() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectPopup>
-                  {[0.75, 1, 1.25, 1.5].map((speed) => (
+                  {READ_ALOUD_SPEEDS.map((speed) => (
                     <SelectItem key={speed} value={String(speed)}>
                       {speed}×
                     </SelectItem>
@@ -750,7 +753,7 @@ export function ReadAloudSettingsSection() {
                 size="sm"
                 variant="outline"
                 onClick={() =>
-                  state.id === "read-aloud-preview" && state.status !== "error"
+                  previewing
                     ? readAloudController.stop()
                     : void readAloudController.start(
                         "read-aloud-preview",
@@ -759,9 +762,7 @@ export function ReadAloudSettingsSection() {
                       )
                 }
               >
-                {state.id === "read-aloud-preview" && state.status !== "error"
-                  ? gt("Stop preview")
-                  : gt("Play preview")}
+                {previewing ? gt("Stop preview") : gt("Play preview")}
               </Button>
             }
           />

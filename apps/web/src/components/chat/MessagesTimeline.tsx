@@ -1,6 +1,7 @@
 import { readAloudController } from "../../speech/readAloud";
 import { readAloudSourceAt } from "../../speech/readAloudHighlight";
 import { toastReadAloudError } from "./ReadAloudButton";
+import { ReadAloudPlayer } from "./ReadAloudPlayer";
 import { T, useGT, useMessages, Var } from "gt-react";
 import type { SideThreadOpenIntent } from "@t3tools/client-runtime/side-thread";
 import type { ThreadRunSummary } from "@t3tools/client-runtime/state/models";
@@ -1530,6 +1531,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
                 {...(readFromHere ? { readFromHere } : {})}
               />
             ) : null}
+            <ReadAloudPlayer threadKey={routeThreadKey} />
             <LegendList<MessagesTimelineRow>
               ref={setTimelineList}
               data={rows}
