@@ -6,7 +6,12 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { usageEnvironmentProgress, usageLoadingState, usageProgress } from "./usageProgress.ts";
+import {
+  usageEnvironmentProgress,
+  usageLoadingState,
+  usageProgress,
+  usageProgressFraction,
+} from "./usageProgress.ts";
 
 function summary(refreshing: readonly UsageProviderKind[] = []): UsageSummary {
   return {
@@ -116,5 +121,36 @@ describe("usageLoadingState", () => {
       environment("c", { summary: null, error: "Offline" }),
     ]);
     expect(state).toEqual({ partial: false, everyProvider: false, providers: new Set() });
+  });
+});
+
+describe("usageProgressFraction", () => {
+  it("is unknown until an environment answers", () => {
+    expect(
+      usageProgressFraction([environment("a", { summary: null, isPending: true })]),
+    ).toBeNull();
+    expect(usageProgressFraction([environment("a", { isPending: true })], true)).toBeNull();
+    expect(usageProgressFraction([])).toBeNull();
+  });
+
+  it("counts answered environments and settled sources", () => {
+    const loading = environment("b", { summary: null, isPending: true });
+    expect(usageProgressFraction([environment("a"), loading])).toBe(0.5);
+    // codex settled, cursor and grok still refreshing: one of three sources.
+    const partway = environment("a", { isPending: true, summary: summary(["cursor", "grok"]) });
+    expect(usageProgressFraction([partway])).toBeCloseTo(1 / 3);
+    expect(usageProgressFraction([partway, loading])).toBeCloseTo(1 / 6);
+  });
+
+  it("skips hidden providers and environments that cannot answer", () => {
+    const partway = environment("a", { isPending: true, summary: summary(["cursor"]) });
+    expect(usageProgressFraction([partway], false, new Set(["cursor"]))).toBe(1);
+    expect(
+      usageProgressFraction([
+        partway,
+        environment("offline", { summary: null, isConnected: false }),
+        environment("failed", { summary: null, error: "Offline" }),
+      ]),
+    ).toBe(0.5);
   });
 });
