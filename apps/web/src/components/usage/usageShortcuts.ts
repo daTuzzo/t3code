@@ -17,6 +17,13 @@ export const WINDOW_OPTIONS = [
   { days: 90, label: msg("90 days"), command: "usage.period.quarter" },
 ] as const;
 
+/** Every rolling period on the page; the longer ones have no keybinding command. */
+export const PERIOD_OPTIONS = [
+  ...WINDOW_OPTIONS,
+  { days: 180, label: msg("180 days") },
+  { days: 365, label: msg("1 year") },
+] as const;
+
 export function resolveUsageShortcut(
   event: ShortcutEventLike & { target: EventTarget | null },
   keybindings: ResolvedKeybindingsConfig,

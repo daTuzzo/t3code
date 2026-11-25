@@ -1,13 +1,21 @@
-import { UsageProviderKind } from "@t3tools/contracts";
+import { UsageDay, UsageProviderKind } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import { getLocalStorageItem, setLocalStorageItem } from "../../hooks/useLocalStorage";
 
 const STORAGE_KEY = "t3code:usage-page-preferences:v1";
+const UsageDayRange = Schema.Struct({ sinceDay: UsageDay, untilDay: UsageDay }).check(
+  Schema.makeFilter((range) => range.sinceDay <= range.untilDay),
+);
+export type UsageDayRange = typeof UsageDayRange.Type;
 const UsagePagePreferencesSchema = Schema.Struct({
   metric: Schema.Literals(["cost", "tokens", "limits"]),
-  windowDays: Schema.Literals([1, 7, 30, 90]),
+  /** Kept while a custom range shows, so a saved custom choice falls back to a rolling period. */
+  windowDays: Schema.Literals([1, 7, 30, 90, 180, 365]),
   hiddenProviders: Schema.optional(Schema.Array(UsageProviderKind)),
+  /** The last picked range stays for the picker after a rolling period is chosen again. */
+  customRange: Schema.optional(UsageDayRange),
+  customRangeActive: Schema.optional(Schema.Boolean),
 });
 export type UsagePagePreferences = typeof UsagePagePreferencesSchema.Type;
 
