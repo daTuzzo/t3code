@@ -20,6 +20,7 @@ import {
   updatingProvidersLabel,
   usageEnvironmentProgress,
   usageLoadingState,
+  usageProgressFraction,
 } from "@t3tools/client-runtime/state/usage-progress";
 
 import {
@@ -91,10 +92,17 @@ import {
 } from "./usageBreakdown";
 import {
   METRIC_OPTIONS,
+  PERIOD_OPTIONS,
   WINDOW_OPTIONS,
   resolveUsageShortcut,
   type UsageMetric,
 } from "./usageShortcuts";
+import {
+  UsageCustomRangeCalendar,
+  UsageDayRangeLabel,
+  UsageLoadingRing,
+} from "./UsagePeriodControls";
+import { isCustomUsagePeriod, usageDayRangeFromWindow, usagePeriodWindow } from "./usagePeriod";
 import {
   PROVIDER_ORDER,
   PROVIDER_PRESENTATION,
@@ -104,6 +112,7 @@ import {
 import {
   readUsagePagePreferences,
   saveUsagePagePreferences,
+  type UsageDayRange,
   type UsagePagePreferences,
 } from "./usagePagePreferences";
 
@@ -112,7 +121,7 @@ function isUsageMetric(value: string | null | undefined): value is UsageMetric {
 }
 
 function isUsageWindowDays(value: number): value is UsagePagePreferences["windowDays"] {
-  return WINDOW_OPTIONS.some((option) => option.days === value);
+  return PERIOD_OPTIONS.some((option) => option.days === value);
 }
 
 const providerLabel = (provider: UsageProviderKind) => PROVIDER_PRESENTATION[provider].label;
@@ -182,23 +191,25 @@ export function UsagePage() {
   const locale = useLocale();
   const m = useMessages();
   const shortcutTitle = (
-    option: (typeof METRIC_OPTIONS)[number] | (typeof WINDOW_OPTIONS)[number],
+    option: (typeof METRIC_OPTIONS)[number] | (typeof PERIOD_OPTIONS)[number],
   ) => {
-    const shortcut = shortcutLabelForCommand(keybindings, option.command, {
-      context: { usagePageOpen: true },
-    });
+    const shortcut =
+      "command" in option
+        ? shortcutLabelForCommand(keybindings, option.command, {
+            context: { usagePageOpen: true },
+          })
+        : null;
     return shortcut
       ? gt("{label} ({shortcut})", { label: m(option.label), shortcut })
       : m(option.label);
   };
   const [windowSelection, setWindowSelection] = useState(() => ({
     days: preferences.windowDays,
-    window: makeWindow(
-      preferences.windowDays,
-      undefined,
-      preferences.windowDays === 1 ? "hour" : "day",
-    ),
+    custom: isCustomUsagePeriod(preferences),
+    window: usagePeriodWindow(preferences),
   }));
+  const [customRangePicker, setCustomRangePicker] = useState<"toggle" | "select" | null>(null);
+  const periodSelectRef = useRef<HTMLButtonElement>(null);
   const metric = preferences.metric;
   const showingLimits = metric === "limits";
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -208,8 +219,7 @@ export function UsagePage() {
   const [selectedEnvironmentIds, setSelectedEnvironmentIds] =
     useState<ReadonlySet<EnvironmentId> | null>(null);
   const hiddenProviders = new Set(preferences.hiddenProviders);
-  const { days: windowDays, window } = windowSelection;
-  const isPast24Hours = windowDays === 1;
+  const { days: windowDays, custom: customPeriod, window } = windowSelection;
   const {
     merged: answeredUsage,
     environments,
@@ -242,11 +252,27 @@ export function UsagePage() {
   };
   const selectWindow = (days: number) => {
     if (!isUsageWindowDays(days)) return;
-    updatePreferences({ windowDays: days });
+    updatePreferences({ windowDays: days, customRangeActive: false });
     setWindowSelection({
       days,
+      custom: false,
       window: makeWindow(days, undefined, days === 1 ? "hour" : "day"),
     });
+  };
+  const selectCustomRange = (customRange: UsageDayRange) => {
+    updatePreferences({ customRange, customRangeActive: true });
+    setWindowSelection({
+      days: windowDays,
+      custom: true,
+      window: usagePeriodWindow({ windowDays, customRange, customRangeActive: true }),
+    });
+  };
+  // Opening the picker shows the saved range at once; picking days replaces it.
+  const openCustomRangePicker = (picker: "toggle" | "select") => {
+    if (!customPeriod && preferences.customRange !== undefined) {
+      selectCustomRange(preferences.customRange);
+    }
+    setCustomRangePicker(picker);
   };
   const selectMetric = (nextMetric: UsageMetric) => {
     if (nextMetric === "limits") setLimitsNow(Date.now());
@@ -310,14 +336,14 @@ export function UsagePage() {
       });
       return;
     }
-    const nextWindow = makeWindow(windowDays, undefined, isPast24Hours ? "hour" : "day");
+    const nextWindow = usagePeriodWindow(preferences);
     if (
       nextWindow.sinceDay !== window.sinceDay ||
       nextWindow.untilDay !== window.untilDay ||
       nextWindow.sinceTime !== window.sinceTime ||
       nextWindow.untilTime !== window.untilTime
     ) {
-      setWindowSelection({ days: windowDays, window: nextWindow });
+      setWindowSelection({ days: windowDays, custom: customPeriod, window: nextWindow });
     }
     refreshingRef.current = true;
     setIsRefreshing(true);
@@ -367,8 +393,35 @@ export function UsagePage() {
           start: formatDayShort(shownWindow.sinceDay, locale),
           end: formatDayShort(shownWindow.untilDay, locale),
         });
-  const windowOptionLabel = WINDOW_OPTIONS.find((option) => option.days === windowDays)?.label;
+  const windowOptionLabel = PERIOD_OPTIONS.find((option) => option.days === windowDays)?.label;
   const metricOptionLabel = METRIC_OPTIONS.find((option) => option.value === metric)?.label;
+  const periodValue = customPeriod ? "custom" : String(windowDays);
+  // The saved range names the custom segment even while a rolling period shows, so switching
+  // periods never changes its width and shifts the segments under the pointer.
+  const customLabel =
+    preferences.customRange === undefined ? (
+      gt("Custom", { $context: "usage period" })
+    ) : (
+      <UsageDayRangeLabel range={preferences.customRange} />
+    );
+  const customRangeCalendar = (
+    <UsageCustomRangeCalendar
+      initialRange={preferences.customRange ?? usageDayRangeFromWindow(window)}
+      onApply={(range) => {
+        setCustomRangePicker(null);
+        selectCustomRange(range);
+      }}
+    />
+  );
+  const loadingRing = (
+    <UsageLoadingRing
+      loading={
+        shown === null ||
+        usageLoading(showingKept, selectedEnvironments, refreshingUsage, hiddenProviders).partial
+      }
+      progress={usageProgressFraction(selectedEnvironments, refreshingUsage, hiddenProviders)}
+    />
+  );
   const topbarContent = (
     <div className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 py-2 @4xl/usage-header:flex">
       <WorkspaceBreadcrumb ariaLabel={gt("Usage breadcrumb")} className="min-w-0">
@@ -400,29 +453,44 @@ export function UsagePage() {
           />
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
-      {!showingLimits ? (
+      {/* A custom period already names its range in the period control. */}
+      {!showingLimits && !customPeriod ? (
         <span className="hidden min-w-0 truncate text-xs text-muted-foreground @7xl/usage-header:block">
           {windowLabel}
         </span>
       ) : null}
-      <div className="ms-auto hidden shrink-0 items-center justify-end gap-2 @4xl/usage-header:flex">
+      <div className="ms-auto hidden shrink-0 items-center justify-end gap-2 @6xl/usage-header:flex">
         {/* Limits are always current, so they have no period. The period sits before the metric
             tabs so dropping it never moves them. */}
+        {showingLimits ? null : loadingRing}
         {showingLimits ? null : (
           <ToggleGroup
             aria-label={gt("Usage period")}
             variant="segmented"
-            value={[String(windowDays)]}
+            value={[periodValue]}
             onValueChange={(next) => {
+              // The custom segment opens its picker; the period changes once a range is picked.
               const value = next[0];
-              if (value) selectWindow(Number(value));
+              if (value && value !== "custom") selectWindow(Number(value));
             }}
           >
-            {WINDOW_OPTIONS.map((option) => (
+            {PERIOD_OPTIONS.map((option) => (
               <Toggle key={option.days} value={String(option.days)} title={shortcutTitle(option)}>
                 {m(option.label)}
               </Toggle>
             ))}
+            <Popover
+              open={customRangePicker === "toggle"}
+              onOpenChange={(open) => {
+                if (open) openCustomRangePicker("toggle");
+                else setCustomRangePicker(null);
+              }}
+            >
+              <PopoverTrigger render={<Toggle value="custom" />}>{customLabel}</PopoverTrigger>
+              <PopoverPopup align="end" aria-label={gt("Custom usage period")}>
+                {customRangeCalendar}
+              </PopoverPopup>
+            </Popover>
           </ToggleGroup>
         )}
         <ToggleGroup
@@ -451,19 +519,30 @@ export function UsagePage() {
           <RefreshIcon size="sm" refreshing={isRefreshing} />
         </Button>
       </div>
-      <div className="ms-auto flex shrink-0 items-center justify-end gap-1 @4xl/usage-header:hidden">
+      <div className="ms-auto flex shrink-0 items-center justify-end gap-1 @6xl/usage-header:hidden">
+        {showingLimits ? null : loadingRing}
         {showingLimits ? null : (
-          <Select value={String(windowDays)} onValueChange={(value) => selectWindow(Number(value))}>
+          <Select
+            value={periodValue}
+            onValueChange={(value) => {
+              // Picking Custom again reopens the picker, since Select reports every pick.
+              if (value === "custom") openCustomRangePicker("select");
+              else selectWindow(Number(value));
+            }}
+          >
             <SelectTrigger
+              ref={periodSelectRef}
               aria-label={gt("Usage period")}
               size="compact"
               variant="ghost"
               className="w-auto min-w-0"
             >
-              <SelectValue>{windowOptionLabel && m(windowOptionLabel)}</SelectValue>
+              <SelectValue>
+                {customPeriod ? customLabel : windowOptionLabel && m(windowOptionLabel)}
+              </SelectValue>
             </SelectTrigger>
             <SelectPopup align="end" alignItemWithTrigger={false}>
-              {WINDOW_OPTIONS.map((option) => (
+              {PERIOD_OPTIONS.map((option) => (
                 <SelectItem
                   key={option.days}
                   value={String(option.days)}
@@ -472,8 +551,23 @@ export function UsagePage() {
                   {m(option.label)}
                 </SelectItem>
               ))}
+              <SelectItem value="custom">{customLabel}</SelectItem>
             </SelectPopup>
           </Select>
+        )}
+        {showingLimits ? null : (
+          <Popover
+            open={customRangePicker === "select"}
+            onOpenChange={(open) => setCustomRangePicker(open ? "select" : null)}
+          >
+            <PopoverPopup
+              align="end"
+              anchor={periodSelectRef}
+              aria-label={gt("Custom usage period")}
+            >
+              {customRangeCalendar}
+            </PopoverPopup>
+          </Popover>
         )}
         <Select
           value={metric}

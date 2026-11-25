@@ -74,6 +74,39 @@ export function usageProgress(
   };
 }
 
+/**
+ * Share of the selected environments' usage that has answered: whole environments, and within an
+ * environment the sources that are no longer refreshing. Null while nothing has answered, because a
+ * cold scan reports no progress until its first answer.
+ */
+export function usageProgressFraction(
+  environments: readonly UsageProgressEnvironment[],
+  refreshing = false,
+  hiddenProviders: ReadonlySet<UsageProviderKind> = new Set(),
+): number | null {
+  let active = 0;
+  let answered = 0;
+  let known = false;
+  for (const environment of environments) {
+    const progress = usageEnvironmentProgress(environment, refreshing);
+    if (progress.phase === "inactive") continue;
+    active += 1;
+    if (progress.phase === "ready") {
+      answered += 1;
+      known = true;
+    } else if (progress.phase === "partway") {
+      const sources =
+        environment.summary?.sources.filter(
+          (source) => !hiddenProviders.has(source.fingerprint.provider),
+        ) ?? [];
+      const settled = sources.filter((source) => source.refreshing !== true).length;
+      answered += sources.length === 0 ? 1 : settled / sources.length;
+      known = true;
+    }
+  }
+  return known && active > 0 ? answered / active : null;
+}
+
 export function usageLoadingState(
   environments: readonly UsageProgressEnvironment[],
   refreshing = false,
